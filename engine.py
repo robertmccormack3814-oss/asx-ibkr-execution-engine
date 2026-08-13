@@ -1,4 +1,4 @@
-import json, math, os, pathlib, requests
+import json, math, pathlib, requests
 from datetime import datetime, timezone
 
 from ib_insync import IB, Stock, LimitOrder, StopOrder
@@ -70,7 +70,7 @@ def open_symbols(ib):
 
 
 def open_risk_pct(ib, equity):
-    # Conservative placeholder for v1: count live positions at configured risk budget.
+    # Conservative v1 approximation: each live position consumes one configured risk budget.
     return len(open_symbols(ib)) * CONFIG["risk_per_trade_pct"]
 
 
@@ -127,35 +127,60 @@ def main():
     state = load_state()
 
     ib = IB()
-    ib.connect(CONFIG["ibkr"]["host"], CONFIG["ibkr"]["port"], clientId=CONFIG["ibkr"]["client_id"], timeout=10)
+    # In dry-run mode, connect explicitly read-only so TWS never receives order-capable requests.
+    ib.connect(
+        CONFIG["ibkr"]["host"],
+        CONFIG["ibkr"]["port"],
+        clientId=CONFIG["ibkr"]["client_id"],
+        timeout=10,
+        readonly=bool(CONFIG["dry_run"]),
+    )
     try:
+        # Prefer live data when entitled; otherwise IBKR will return delayed data (15-20 min) when available.
+        ib.reqMarketDataType(3)
         equity = current_equity(ib)
         open_syms = open_symbols(ib)
         risk_pct = open_risk_pct(ib, equity)
+        log_event("ACCOUNT", {"equity": equity, "open_positions": sorted(open_syms), "open_risk_pct": risk_pct, "dry_run": CONFIG["dry_run"]})
 
         for sig in active:
             key = signal_key(sig)
-            if key in state["seen_signals"]:
+            if key in state["seen_signals"] and state["seen_signals"][key].get("status") in {"SUBMITTED", "FILLED"}:
                 continue
 
             contract = Stock(sig["symbol"], CONFIG["exchange"], CONFIG["currency"])
             ib.qualifyContracts(contract)
             ticker = ib.reqMktData(contract, "", False, False)
-            ib.sleep(1)
+            ib.sleep(2)
             market_price = ticker.marketPrice()
+            price_source = "IBKR"
             if not market_price or math.isnan(market_price):
                 market_price = float(sig["entry_price"])
+                price_source = "SIGNAL_FALLBACK"
+            ib.cancelMktData(contract)
 
             ok, result = validate_signal(sig, market_price, equity, open_syms, risk_pct)
             if not ok:
-                state["seen_signals"][key] = {"status": "SKIPPED", "reason": result, "timestamp": now_iso()}
-                log_event("SKIP", {"signal": key, "symbol": sig.get("symbol"), "reason": result})
+                if not CONFIG["dry_run"]:
+                    state["seen_signals"][key] = {"status": "SKIPPED", "reason": result, "timestamp": now_iso()}
+                log_event("SKIP", {"signal": key, "symbol": sig.get("symbol"), "reason": result, "market_price": market_price, "price_source": price_source})
                 continue
 
             qty = result
             if CONFIG["dry_run"]:
-                state["seen_signals"][key] = {"status": "DRY_RUN", "qty": qty, "timestamp": now_iso()}
-                log_event("DRY_RUN", {"signal": key, "symbol": sig["symbol"], "qty": qty, "entry": sig["entry_price"], "stop": sig["stop_loss"], "target": sig["profit_target"]})
+                # Dry runs are repeatable and deliberately do not consume the signal in state.json.
+                log_event("DRY_RUN", {
+                    "signal": key,
+                    "symbol": sig["symbol"],
+                    "qty": qty,
+                    "market_price": market_price,
+                    "price_source": price_source,
+                    "entry": sig["entry_price"],
+                    "stop": sig["stop_loss"],
+                    "target": sig["profit_target"],
+                    "planned_risk_aud": qty * abs(float(sig["entry_price"]) - float(sig["stop_loss"])),
+                    "position_value_aud": qty * float(sig["entry_price"]),
+                })
                 continue
 
             trades = place_bracket(ib, sig, qty)
