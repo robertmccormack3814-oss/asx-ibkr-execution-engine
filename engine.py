@@ -80,7 +80,6 @@ def open_symbols(ib):
 
 
 def open_risk_pct(ib, equity):
-    # Conservative v1 approximation: each live position consumes one configured risk budget.
     return len(open_symbols(ib)) * CONFIG["risk_per_trade_pct"]
 
 
@@ -137,7 +136,6 @@ def main():
     state = load_state()
 
     ib = IB()
-    # In dry-run mode, connect explicitly read-only so TWS never receives order-capable requests.
     ib.connect(
         CONFIG["ibkr"]["host"],
         CONFIG["ibkr"]["port"],
@@ -146,12 +144,14 @@ def main():
         readonly=bool(CONFIG["dry_run"]),
     )
     try:
-        # Prefer live data when entitled; otherwise IBKR will return delayed data when available.
         ib.reqMarketDataType(3)
         actual_equity = current_equity(ib)
         equity = sizing_equity(actual_equity)
         open_syms = open_symbols(ib)
         risk_pct = open_risk_pct(ib, equity)
+        submitted_this_run = 0
+        max_new = int(CONFIG.get("max_new_orders_per_run", 1))
+
         log_event("ACCOUNT", {
             "ibkr_equity": actual_equity,
             "sizing_equity": equity,
@@ -161,6 +161,7 @@ def main():
             "risk_per_trade_pct": CONFIG["risk_per_trade_pct"],
             "risk_budget_aud": equity * CONFIG["risk_per_trade_pct"] / 100.0,
             "dry_run": CONFIG["dry_run"],
+            "max_new_orders_per_run": max_new,
         })
 
         for sig in active:
@@ -188,7 +189,6 @@ def main():
 
             qty = result
             if CONFIG["dry_run"]:
-                # Dry runs are repeatable and deliberately do not consume the signal in state.json.
                 log_event("DRY_RUN", {
                     "signal": key,
                     "symbol": sig["symbol"],
@@ -204,11 +204,20 @@ def main():
                 })
                 continue
 
+            if submitted_this_run >= max_new:
+                log_event("DEFER", {
+                    "signal": key,
+                    "symbol": sig["symbol"],
+                    "reason": f"max_new_orders_per_run={max_new} reached",
+                })
+                continue
+
             trades = place_bracket(ib, sig, qty)
             state["seen_signals"][key] = {"status": "SUBMITTED", "qty": qty, "order_ids": [t.order.orderId for t in trades], "timestamp": now_iso()}
             log_event("SUBMIT", {"signal": key, "symbol": sig["symbol"], "qty": qty, "order_ids": [t.order.orderId for t in trades], "sizing_equity_aud": equity})
             open_syms.add(sig["symbol"])
             risk_pct += CONFIG["risk_per_trade_pct"]
+            submitted_this_run += 1
 
         save_state(state)
     finally:
