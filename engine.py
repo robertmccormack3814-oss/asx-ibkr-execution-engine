@@ -1,5 +1,6 @@
 import json, math, pathlib, requests
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 from ib_insync import IB, Stock, LimitOrder, StopOrder
 
@@ -119,21 +120,123 @@ def validate_signal(sig, market_price, equity, open_syms, total_open_risk_pct):
     return True, qty
 
 
+def contract_market_rule(ib, contract):
+    details = ib.reqContractDetails(contract)
+    if not details:
+        raise RuntimeError(f"No contract details returned for {contract.symbol}")
+
+    detail = details[0]
+    exchanges = [x.strip() for x in str(detail.validExchanges or "").split(",") if x.strip()]
+    rule_ids = [x.strip() for x in str(detail.marketRuleIds or "").split(",") if x.strip()]
+    desired_exchange = str(contract.exchange or CONFIG["exchange"])
+
+    market_rule_id = None
+    if desired_exchange in exchanges:
+        idx = exchanges.index(desired_exchange)
+        if idx < len(rule_ids) and rule_ids[idx]:
+            market_rule_id = int(rule_ids[idx])
+    elif rule_ids:
+        market_rule_id = int(rule_ids[0])
+
+    if market_rule_id is None:
+        raise RuntimeError(
+            f"Could not determine market rule for {contract.symbol}; "
+            f"exchange={desired_exchange}, validExchanges={exchanges}, marketRuleIds={rule_ids}"
+        )
+
+    increments = ib.reqMarketRule(market_rule_id)
+    if not increments:
+        raise RuntimeError(f"No price increments returned for market rule {market_rule_id} ({contract.symbol})")
+
+    return market_rule_id, sorted(increments, key=lambda x: float(x.lowEdge))
+
+
+def increment_for_price(price, increments):
+    applicable = increments[0]
+    for inc in increments:
+        if float(price) >= float(inc.lowEdge):
+            applicable = inc
+        else:
+            break
+    tick = float(applicable.increment)
+    if tick <= 0:
+        raise RuntimeError(f"Invalid market-rule tick {tick} for price {price}")
+    return tick
+
+
+def snap_to_tick(price, tick, mode="nearest"):
+    p = Decimal(str(price))
+    t = Decimal(str(tick))
+    units = p / t
+    if mode == "up":
+        rounded_units = units.to_integral_value(rounding=ROUND_CEILING)
+    elif mode == "down":
+        rounded_units = units.to_integral_value(rounding=ROUND_FLOOR)
+    else:
+        rounded_units = units.to_integral_value(rounding=ROUND_HALF_UP)
+    return float(rounded_units * t)
+
+
+def executable_bracket_prices(ib, contract, sig):
+    market_rule_id, increments = contract_market_rule(ib, contract)
+
+    raw_entry = float(sig["entry_price"])
+    raw_target = float(sig["profit_target"])
+    raw_stop = float(sig["stop_loss"])
+
+    entry_tick = increment_for_price(raw_entry, increments)
+    target_tick = increment_for_price(raw_target, increments)
+    stop_tick = increment_for_price(raw_stop, increments)
+
+    # Conservative snapping: nearest entry, target slightly easier (down),
+    # protective sell stop slightly tighter (up).
+    entry = snap_to_tick(raw_entry, entry_tick, "nearest")
+    target = snap_to_tick(raw_target, target_tick, "down")
+    stop = snap_to_tick(raw_stop, stop_tick, "up")
+
+    if not (stop < entry < target):
+        raise RuntimeError(
+            f"Invalid snapped bracket for {sig['symbol']}: stop={stop}, entry={entry}, target={target}"
+        )
+
+    return {
+        "market_rule_id": market_rule_id,
+        "raw_entry": raw_entry,
+        "raw_target": raw_target,
+        "raw_stop": raw_stop,
+        "entry": entry,
+        "target": target,
+        "stop": stop,
+        "entry_tick": entry_tick,
+        "target_tick": target_tick,
+        "stop_tick": stop_tick,
+    }
+
+
 def place_bracket(ib, sig, qty):
     symbol = sig["symbol"]
-    entry = round(float(sig["entry_price"]), 3)
-    target = round(float(sig["profit_target"]), 3)
-    stop = round(float(sig["stop_loss"]), 3)
     contract = Stock(symbol, CONFIG["exchange"], CONFIG["currency"])
     ib.qualifyContracts(contract)
+    prices = executable_bracket_prices(ib, contract, sig)
 
     parent_id = ib.client.getReqId()
     take_id = ib.client.getReqId()
     stop_id = ib.client.getReqId()
 
-    parent = LimitOrder("BUY", qty, entry, orderId=parent_id, transmit=False, tif=CONFIG["time_in_force"], account=CONFIG["ibkr"]["account"])
-    take = LimitOrder("SELL", qty, target, orderId=take_id, parentId=parent_id, transmit=False, tif="GTC", account=CONFIG["ibkr"]["account"])
-    protective = StopOrder("SELL", qty, stop, orderId=stop_id, parentId=parent_id, transmit=True, tif="GTC", account=CONFIG["ibkr"]["account"])
+    parent = LimitOrder(
+        "BUY", qty, prices["entry"], orderId=parent_id, transmit=False,
+        tif=CONFIG["time_in_force"], account=CONFIG["ibkr"]["account"]
+    )
+    take = LimitOrder(
+        "SELL", qty, prices["target"], orderId=take_id, parentId=parent_id,
+        transmit=False, tif="GTC", account=CONFIG["ibkr"]["account"]
+    )
+    protective = StopOrder(
+        "SELL", qty, prices["stop"], orderId=stop_id, parentId=parent_id,
+        transmit=True, tif="GTC", account=CONFIG["ibkr"]["account"]
+    )
+
+    log_event("PRICE_SNAP", {"symbol": symbol, **prices})
 
     trades = []
     trades.append(ib.placeOrder(contract, parent))
