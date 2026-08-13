@@ -146,16 +146,30 @@ def place_bracket(ib, sig, qty):
 
 
 def trade_snapshot(trade):
+    logs = []
+    for item in trade.log:
+        logs.append({
+            "time": str(getattr(item, "time", "")),
+            "status": getattr(item, "status", ""),
+            "message": getattr(item, "message", ""),
+            "error_code": getattr(item, "errorCode", 0),
+        })
+
     return {
         "order_id": trade.order.orderId,
+        "perm_id": getattr(trade.order, "permId", 0),
+        "client_id": getattr(trade.order, "clientId", 0),
         "parent_id": trade.order.parentId,
         "action": trade.order.action,
         "order_type": trade.order.orderType,
         "status": trade.orderStatus.status,
+        "why_held": getattr(trade.orderStatus, "whyHeld", ""),
+        "mkt_cap_price": getattr(trade.orderStatus, "mktCapPrice", 0),
         "transmit": trade.order.transmit,
         "limit_price": getattr(trade.order, "lmtPrice", None),
         "aux_price": getattr(trade.order, "auxPrice", None),
-        "errors": [str(item) for item in trade.log if getattr(item, "errorCode", 0)],
+        "advanced_error": str(getattr(trade, "advancedError", "") or ""),
+        "log": logs,
     }
 
 
@@ -178,8 +192,13 @@ def bracket_acknowledged(trades):
         and snapshots[2]["transmit"] is True
     )
     status_ok = all(s["status"] in acceptable_statuses for s in snapshots)
-    error_free = all(not s["errors"] for s in snapshots)
-    return structure_ok and status_ok and error_free, snapshots
+    no_hold_reason = all(not s["why_held"] for s in snapshots)
+    no_errors = all(
+        not s["advanced_error"]
+        and all(not row["error_code"] for row in s["log"])
+        for s in snapshots
+    )
+    return structure_ok and status_ok and no_hold_reason and no_errors, snapshots
 
 
 def main():
