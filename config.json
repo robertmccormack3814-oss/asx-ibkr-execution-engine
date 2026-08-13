@@ -1,7 +1,7 @@
 {
   "source_scanner_url": "https://raw.githubusercontent.com/robertmccormack3814-oss/asx-opportunity-engine/main/data/scanner.json",
   "paper_only": true,
-  "dry_run": true,
+  "dry_run": false,
   "kill_switch": false,
   "test_equity_override_aud": 10000,
   "risk_per_trade_pct": 0.5,
@@ -19,6 +19,6 @@
     "host": "127.0.0.1",
     "port": 7497,
     "client_id": 17,
-    "account": null
+    "account": "DUR858795"
   }
 }
