@@ -7,6 +7,7 @@
   "risk_per_trade_pct": 0.5,
   "max_total_open_risk_pct": 4.0,
   "max_open_positions": 6,
+  "max_new_orders_per_run": 1,
   "max_entry_drift_pct": 1.0,
   "min_order_value_aud": 200,
   "max_order_value_pct_of_equity": 30.0,
