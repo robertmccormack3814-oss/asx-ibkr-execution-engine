@@ -98,6 +98,10 @@ def open_risk_pct(ib, equity):
     return len(open_symbols(ib)) * CONFIG["risk_per_trade_pct"]
 
 
+def make_asx_contract(symbol):
+    return Stock(symbol, "SMART", CONFIG["currency"], primaryExchange="ASX")
+
+
 def validate_signal(sig, market_price, equity, open_syms, total_open_risk_pct):
     symbol = sig.get("symbol")
     entry = float(sig.get("entry_price") or 0)
@@ -128,7 +132,7 @@ def contract_market_rule(ib, contract):
     detail = details[0]
     exchanges = [x.strip() for x in str(detail.validExchanges or "").split(",") if x.strip()]
     rule_ids = [x.strip() for x in str(detail.marketRuleIds or "").split(",") if x.strip()]
-    desired_exchange = str(contract.exchange or CONFIG["exchange"])
+    desired_exchange = str(contract.primaryExchange or "ASX")
 
     market_rule_id = None
     if desired_exchange in exchanges:
@@ -188,8 +192,6 @@ def executable_bracket_prices(ib, contract, sig):
     target_tick = increment_for_price(raw_target, increments)
     stop_tick = increment_for_price(raw_stop, increments)
 
-    # Conservative snapping: nearest entry, target slightly easier (down),
-    # protective sell stop slightly tighter (up).
     entry = snap_to_tick(raw_entry, entry_tick, "nearest")
     target = snap_to_tick(raw_target, target_tick, "down")
     stop = snap_to_tick(raw_stop, stop_tick, "up")
@@ -215,7 +217,7 @@ def executable_bracket_prices(ib, contract, sig):
 
 def place_bracket(ib, sig, qty):
     symbol = sig["symbol"]
-    contract = Stock(symbol, CONFIG["exchange"], CONFIG["currency"])
+    contract = make_asx_contract(symbol)
     ib.qualifyContracts(contract)
     prices = executable_bracket_prices(ib, contract, sig)
 
@@ -236,7 +238,12 @@ def place_bracket(ib, sig, qty):
         transmit=True, tif="GTC", account=CONFIG["ibkr"]["account"]
     )
 
-    log_event("PRICE_SNAP", {"symbol": symbol, **prices})
+    log_event("PRICE_SNAP", {
+        "symbol": symbol,
+        "route": "SMART",
+        "primary_exchange": "ASX",
+        **prices,
+    })
 
     trades = []
     trades.append(ib.placeOrder(contract, parent))
@@ -351,7 +358,7 @@ def main():
             if key in state["seen_signals"] and state["seen_signals"][key].get("status") in {"SUBMITTED", "FILLED"}:
                 continue
 
-            contract = Stock(sig["symbol"], CONFIG["exchange"], CONFIG["currency"])
+            contract = make_asx_contract(sig["symbol"])
             ib.qualifyContracts(contract)
             ticker = ib.reqMktData(contract, "", False, False)
             ib.sleep(2)
