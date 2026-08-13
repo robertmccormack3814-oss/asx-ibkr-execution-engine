@@ -65,6 +65,16 @@ def current_equity(ib):
     raise RuntimeError("Could not determine account equity")
 
 
+def sizing_equity(actual_equity):
+    override = CONFIG.get("test_equity_override_aud")
+    if CONFIG.get("paper_only") and override is not None:
+        override = float(override)
+        if override <= 0:
+            raise RuntimeError("test_equity_override_aud must be greater than zero")
+        return override
+    return actual_equity
+
+
 def open_symbols(ib):
     return {p.contract.symbol for p in ib.positions() if p.position != 0}
 
@@ -136,12 +146,22 @@ def main():
         readonly=bool(CONFIG["dry_run"]),
     )
     try:
-        # Prefer live data when entitled; otherwise IBKR will return delayed data (15-20 min) when available.
+        # Prefer live data when entitled; otherwise IBKR will return delayed data when available.
         ib.reqMarketDataType(3)
-        equity = current_equity(ib)
+        actual_equity = current_equity(ib)
+        equity = sizing_equity(actual_equity)
         open_syms = open_symbols(ib)
         risk_pct = open_risk_pct(ib, equity)
-        log_event("ACCOUNT", {"equity": equity, "open_positions": sorted(open_syms), "open_risk_pct": risk_pct, "dry_run": CONFIG["dry_run"]})
+        log_event("ACCOUNT", {
+            "ibkr_equity": actual_equity,
+            "sizing_equity": equity,
+            "test_equity_override": equity != actual_equity,
+            "open_positions": sorted(open_syms),
+            "open_risk_pct": risk_pct,
+            "risk_per_trade_pct": CONFIG["risk_per_trade_pct"],
+            "risk_budget_aud": equity * CONFIG["risk_per_trade_pct"] / 100.0,
+            "dry_run": CONFIG["dry_run"],
+        })
 
         for sig in active:
             key = signal_key(sig)
@@ -180,12 +200,13 @@ def main():
                     "target": sig["profit_target"],
                     "planned_risk_aud": qty * abs(float(sig["entry_price"]) - float(sig["stop_loss"])),
                     "position_value_aud": qty * float(sig["entry_price"]),
+                    "sizing_equity_aud": equity,
                 })
                 continue
 
             trades = place_bracket(ib, sig, qty)
             state["seen_signals"][key] = {"status": "SUBMITTED", "qty": qty, "order_ids": [t.order.orderId for t in trades], "timestamp": now_iso()}
-            log_event("SUBMIT", {"signal": key, "symbol": sig["symbol"], "qty": qty, "order_ids": [t.order.orderId for t in trades]})
+            log_event("SUBMIT", {"signal": key, "symbol": sig["symbol"], "qty": qty, "order_ids": [t.order.orderId for t in trades], "sizing_equity_aud": equity})
             open_syms.add(sig["symbol"])
             risk_pct += CONFIG["risk_per_trade_pct"]
 
