@@ -75,6 +75,20 @@ def sizing_equity(actual_equity):
     return actual_equity
 
 
+def assert_expected_paper_account(ib):
+    accounts = ib.managedAccounts()
+    expected = str(CONFIG.get("ibkr", {}).get("account") or "").strip()
+    if not expected:
+        raise RuntimeError("Refusing execution: ibkr.account is not configured")
+    if not expected.startswith("DU"):
+        raise RuntimeError(f"Refusing execution: configured account {expected} is not a DU paper account")
+    if expected not in accounts:
+        raise RuntimeError(f"Refusing execution: expected paper account {expected} not connected; connected={accounts}")
+    if len(accounts) != 1:
+        raise RuntimeError(f"Refusing execution: expected exactly one managed account; connected={accounts}")
+    return expected
+
+
 def open_symbols(ib):
     return {p.contract.symbol for p in ib.positions() if p.position != 0}
 
@@ -117,9 +131,9 @@ def place_bracket(ib, sig, qty):
     take_id = ib.client.getReqId()
     stop_id = ib.client.getReqId()
 
-    parent = LimitOrder("BUY", qty, entry, orderId=parent_id, transmit=False, tif=CONFIG["time_in_force"])
-    take = LimitOrder("SELL", qty, target, orderId=take_id, parentId=parent_id, transmit=False, tif="GTC")
-    protective = StopOrder("SELL", qty, stop, orderId=stop_id, parentId=parent_id, transmit=True, tif="GTC")
+    parent = LimitOrder("BUY", qty, entry, orderId=parent_id, transmit=False, tif=CONFIG["time_in_force"], account=CONFIG["ibkr"]["account"])
+    take = LimitOrder("SELL", qty, target, orderId=take_id, parentId=parent_id, transmit=False, tif="GTC", account=CONFIG["ibkr"]["account"])
+    protective = StopOrder("SELL", qty, stop, orderId=stop_id, parentId=parent_id, transmit=True, tif="GTC", account=CONFIG["ibkr"]["account"])
 
     trades = [ib.placeOrder(contract, parent), ib.placeOrder(contract, take), ib.placeOrder(contract, protective)]
     return trades
@@ -144,6 +158,7 @@ def main():
         readonly=bool(CONFIG["dry_run"]),
     )
     try:
+        paper_account = assert_expected_paper_account(ib)
         ib.reqMarketDataType(3)
         actual_equity = current_equity(ib)
         equity = sizing_equity(actual_equity)
@@ -153,6 +168,8 @@ def main():
         max_new = int(CONFIG.get("max_new_orders_per_run", 1))
 
         log_event("ACCOUNT", {
+            "account": paper_account,
+            "paper_guard_verified": True,
             "ibkr_equity": actual_equity,
             "sizing_equity": equity,
             "test_equity_override": equity != actual_equity,
@@ -214,7 +231,7 @@ def main():
 
             trades = place_bracket(ib, sig, qty)
             state["seen_signals"][key] = {"status": "SUBMITTED", "qty": qty, "order_ids": [t.order.orderId for t in trades], "timestamp": now_iso()}
-            log_event("SUBMIT", {"signal": key, "symbol": sig["symbol"], "qty": qty, "order_ids": [t.order.orderId for t in trades], "sizing_equity_aud": equity})
+            log_event("SUBMIT", {"signal": key, "symbol": sig["symbol"], "qty": qty, "order_ids": [t.order.orderId for t in trades], "account": paper_account, "sizing_equity_aud": equity})
             open_syms.add(sig["symbol"])
             risk_pct += CONFIG["risk_per_trade_pct"]
             submitted_this_run += 1
