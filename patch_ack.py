@@ -39,8 +39,7 @@ if old_ack in text:
 elif "parent_hold_ok" not in text or "child_holds_ok" not in text:
     raise SystemExit("Acknowledgement patch target not found; refusing partial patch.")
 
-# 2) Discover working IBKR orders independently of local state.json. This
-# protects against duplicate brackets after a restart or state reset.
+# 2) Discover working IBKR orders independently of local state.json.
 old_helper = '''def open_symbols(ib):
     return {p.contract.symbol for p in ib.positions() if p.position != 0}
 
@@ -52,8 +51,6 @@ new_helper = '''def open_symbols(ib):
 
 
 def working_order_symbols(ib):
-    # Ask TWS for all currently open orders so duplicate protection survives
-    # engine restarts and local state.json resets.
     trades = ib.reqAllOpenOrders()
     working_statuses = {"PendingSubmit", "PreSubmitted", "Submitted", "PendingCancel"}
     return {
@@ -61,6 +58,13 @@ def working_order_symbols(ib):
         for trade in trades
         if trade.contract.symbol and trade.orderStatus.status in working_statuses
     }
+
+
+def occupied_symbols(ib):
+    # A symbol consumes one risk slot if it is either a filled position or has
+    # any working bracket leg. Using a set avoids double-counting once an entry
+    # fills while its protective children remain working.
+    return open_symbols(ib) | working_order_symbols(ib)
 
 
 def open_risk_pct(ib, equity):
@@ -71,6 +75,33 @@ if old_helper in text:
 elif "def working_order_symbols(ib):" not in text:
     raise SystemExit("Working-order helper patch target not found; refusing partial patch.")
 
+# Add occupied_symbols if working_order_symbols is already present from a prior run.
+if "def occupied_symbols(ib):" not in text:
+    old = '''def open_risk_pct(ib, equity):
+    return len(open_symbols(ib)) * CONFIG["risk_per_trade_pct"]
+'''
+    new = '''def occupied_symbols(ib):
+    return open_symbols(ib) | working_order_symbols(ib)
+
+
+def open_risk_pct(ib, equity):
+    return len(occupied_symbols(ib)) * CONFIG["risk_per_trade_pct"]
+'''
+    if old not in text:
+        raise SystemExit("Occupied-risk patch target not found.")
+    text = text.replace(old, new, 1)
+    changes.append("occupied-risk accounting")
+else:
+    old = '''def open_risk_pct(ib, equity):
+    return len(open_symbols(ib)) * CONFIG["risk_per_trade_pct"]
+'''
+    new = '''def open_risk_pct(ib, equity):
+    return len(occupied_symbols(ib)) * CONFIG["risk_per_trade_pct"]
+'''
+    if old in text:
+        text = text.replace(old, new, 1)
+        changes.append("occupied-risk accounting")
+
 old_init = '''        equity = sizing_equity(actual_equity)
         open_syms = open_symbols(ib)
         risk_pct = open_risk_pct(ib, equity)
@@ -78,26 +109,49 @@ old_init = '''        equity = sizing_equity(actual_equity)
 new_init = '''        equity = sizing_equity(actual_equity)
         open_syms = open_symbols(ib)
         working_syms = working_order_symbols(ib)
-        risk_pct = open_risk_pct(ib, equity)
+        occupied_syms = open_syms | working_syms
+        risk_pct = len(occupied_syms) * CONFIG["risk_per_trade_pct"]
 '''
 if old_init in text:
     text = text.replace(old_init, new_init, 1)
     changes.append("working-order scan")
-elif "working_syms = working_order_symbols(ib)" not in text:
-    raise SystemExit("Working-order scan patch target not found; refusing partial patch.")
+elif "working_syms = working_order_symbols(ib)" in text and "occupied_syms = open_syms | working_syms" not in text:
+    old = '''        working_syms = working_order_symbols(ib)
+        risk_pct = open_risk_pct(ib, equity)
+'''
+    new = '''        working_syms = working_order_symbols(ib)
+        occupied_syms = open_syms | working_syms
+        risk_pct = len(occupied_syms) * CONFIG["risk_per_trade_pct"]
+'''
+    if old not in text:
+        raise SystemExit("Occupied symbol init patch target not found.")
+    text = text.replace(old, new, 1)
+    changes.append("occupied-risk initialization")
 
 old_log = '''            "open_positions": sorted(open_syms),
+            "working_order_symbols": sorted(working_syms),
             "open_risk_pct": risk_pct,
 '''
 new_log = '''            "open_positions": sorted(open_syms),
             "working_order_symbols": sorted(working_syms),
+            "occupied_symbols": sorted(occupied_syms),
             "open_risk_pct": risk_pct,
 '''
 if old_log in text:
     text = text.replace(old_log, new_log, 1)
-    changes.append("account working-order log")
+    changes.append("occupied-risk account log")
 elif '"working_order_symbols": sorted(working_syms)' not in text:
-    raise SystemExit("Account log patch target not found; refusing partial patch.")
+    old_log2 = '''            "open_positions": sorted(open_syms),
+            "open_risk_pct": risk_pct,
+'''
+    new_log2 = '''            "open_positions": sorted(open_syms),
+            "working_order_symbols": sorted(working_syms),
+            "occupied_symbols": sorted(occupied_syms),
+            "open_risk_pct": risk_pct,
+'''
+    if old_log2 in text:
+        text = text.replace(old_log2, new_log2, 1)
+        changes.append("account working-order log")
 
 old_loop = '''            contract = make_asx_contract(sig["symbol"])
             ib.qualifyContracts(contract)
@@ -128,13 +182,26 @@ old_after_submit = '''            open_syms.add(sig["symbol"])
 '''
 new_after_submit = '''            open_syms.add(sig["symbol"])
             working_syms.add(sig["symbol"])
-            risk_pct += CONFIG["risk_per_trade_pct"]
+            occupied_syms.add(sig["symbol"])
+            risk_pct = len(occupied_syms) * CONFIG["risk_per_trade_pct"]
 '''
 if old_after_submit in text:
     text = text.replace(old_after_submit, new_after_submit, 1)
-    changes.append("same-run duplicate guard")
-elif 'working_syms.add(sig["symbol"])' not in text:
-    raise SystemExit("Same-run guard patch target not found; refusing partial patch.")
+    changes.append("same-run duplicate/risk guard")
+elif 'working_syms.add(sig["symbol"])' in text and 'occupied_syms.add(sig["symbol"])' not in text:
+    old = '''            open_syms.add(sig["symbol"])
+            working_syms.add(sig["symbol"])
+            risk_pct += CONFIG["risk_per_trade_pct"]
+'''
+    new = '''            open_syms.add(sig["symbol"])
+            working_syms.add(sig["symbol"])
+            occupied_syms.add(sig["symbol"])
+            risk_pct = len(occupied_syms) * CONFIG["risk_per_trade_pct"]
+'''
+    if old not in text:
+        raise SystemExit("Same-run occupied-risk patch target not found.")
+    text = text.replace(old, new, 1)
+    changes.append("same-run occupied-risk guard")
 
 path.write_text(text, encoding="utf-8")
 if changes:
