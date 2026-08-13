@@ -3,6 +3,7 @@
   "paper_only": true,
   "dry_run": true,
   "kill_switch": false,
+  "test_equity_override_aud": 10000,
   "risk_per_trade_pct": 0.5,
   "max_total_open_risk_pct": 4.0,
   "max_open_positions": 6,
