@@ -1,7 +1,7 @@
 {
   "source_scanner_url": "https://raw.githubusercontent.com/robertmccormack3814-oss/asx-opportunity-engine/main/data/scanner.json",
   "paper_only": true,
-  "dry_run": false,
+  "dry_run": true,
   "kill_switch": false,
   "test_equity_override_aud": 10000,
   "risk_per_trade_pct": 0.5,
@@ -9,6 +9,13 @@
   "max_open_positions": 6,
   "max_new_orders_per_run": 1,
   "max_entry_drift_pct": 1.0,
+  "max_signal_age_trading_days": 2,
+  "entry_expiry_trading_days": 2,
+  "max_holding_days_by_strategy": {
+    "MEAN_REVERSION": 10,
+    "SQUEEZE_EXPANSION": 15,
+    "TREND_BREAKOUT": 30
+  },
   "min_order_value_aud": 200,
   "max_order_value_pct_of_equity": 30.0,
   "currency": "AUD",
