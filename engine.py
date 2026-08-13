@@ -135,8 +135,13 @@ def place_bracket(ib, sig, qty):
     take = LimitOrder("SELL", qty, target, orderId=take_id, parentId=parent_id, transmit=False, tif="GTC", account=CONFIG["ibkr"]["account"])
     protective = StopOrder("SELL", qty, stop, orderId=stop_id, parentId=parent_id, transmit=True, tif="GTC", account=CONFIG["ibkr"]["account"])
 
-    trades = [ib.placeOrder(contract, parent), ib.placeOrder(contract, take), ib.placeOrder(contract, protective)]
-    ib.sleep(3)
+    trades = []
+    trades.append(ib.placeOrder(contract, parent))
+    ib.sleep(0.1)
+    trades.append(ib.placeOrder(contract, take))
+    ib.sleep(0.1)
+    trades.append(ib.placeOrder(contract, protective))
+    ib.sleep(5)
     return trades
 
 
@@ -155,7 +160,7 @@ def trade_snapshot(trade):
 
 
 def bracket_acknowledged(trades):
-    bad_statuses = {"Cancelled", "ApiCancelled", "Inactive"}
+    acceptable_statuses = {"PreSubmitted", "Submitted", "Filled"}
     snapshots = [trade_snapshot(t) for t in trades]
     ids = {s["order_id"] for s in snapshots}
     parent_id = snapshots[0]["order_id"]
@@ -172,7 +177,7 @@ def bracket_acknowledged(trades):
         and snapshots[2]["order_type"] == "STP"
         and snapshots[2]["transmit"] is True
     )
-    status_ok = all(s["status"] not in bad_statuses for s in snapshots)
+    status_ok = all(s["status"] in acceptable_statuses for s in snapshots)
     error_free = all(not s["errors"] for s in snapshots)
     return structure_ok and status_ok and error_free, snapshots
 
