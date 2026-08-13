@@ -136,7 +136,45 @@ def place_bracket(ib, sig, qty):
     protective = StopOrder("SELL", qty, stop, orderId=stop_id, parentId=parent_id, transmit=True, tif="GTC", account=CONFIG["ibkr"]["account"])
 
     trades = [ib.placeOrder(contract, parent), ib.placeOrder(contract, take), ib.placeOrder(contract, protective)]
+    ib.sleep(3)
     return trades
+
+
+def trade_snapshot(trade):
+    return {
+        "order_id": trade.order.orderId,
+        "parent_id": trade.order.parentId,
+        "action": trade.order.action,
+        "order_type": trade.order.orderType,
+        "status": trade.orderStatus.status,
+        "transmit": trade.order.transmit,
+        "limit_price": getattr(trade.order, "lmtPrice", None),
+        "aux_price": getattr(trade.order, "auxPrice", None),
+        "errors": [str(item) for item in trade.log if getattr(item, "errorCode", 0)],
+    }
+
+
+def bracket_acknowledged(trades):
+    bad_statuses = {"Cancelled", "ApiCancelled", "Inactive"}
+    snapshots = [trade_snapshot(t) for t in trades]
+    ids = {s["order_id"] for s in snapshots}
+    parent_id = snapshots[0]["order_id"]
+    structure_ok = (
+        len(trades) == 3
+        and len(ids) == 3
+        and snapshots[1]["parent_id"] == parent_id
+        and snapshots[2]["parent_id"] == parent_id
+        and snapshots[0]["action"] == "BUY"
+        and snapshots[1]["action"] == "SELL"
+        and snapshots[2]["action"] == "SELL"
+        and snapshots[0]["order_type"] == "LMT"
+        and snapshots[1]["order_type"] == "LMT"
+        and snapshots[2]["order_type"] == "STP"
+        and snapshots[2]["transmit"] is True
+    )
+    status_ok = all(s["status"] not in bad_statuses for s in snapshots)
+    error_free = all(not s["errors"] for s in snapshots)
+    return structure_ok and status_ok and error_free, snapshots
 
 
 def main():
@@ -230,7 +268,14 @@ def main():
                 continue
 
             trades = place_bracket(ib, sig, qty)
-            state["seen_signals"][key] = {"status": "SUBMITTED", "qty": qty, "order_ids": [t.order.orderId for t in trades], "timestamp": now_iso()}
+            acknowledged, snapshots = bracket_acknowledged(trades)
+            log_event("ORDER_ACK", {"signal": key, "symbol": sig["symbol"], "orders": snapshots, "acknowledged": acknowledged})
+            if not acknowledged:
+                state["seen_signals"][key] = {"status": "ACK_FAILED", "qty": qty, "orders": snapshots, "timestamp": now_iso()}
+                save_state(state)
+                raise RuntimeError(f"Bracket acknowledgement failed for {sig['symbol']}; stopping before any further orders")
+
+            state["seen_signals"][key] = {"status": "SUBMITTED", "qty": qty, "order_ids": [t.order.orderId for t in trades], "orders": snapshots, "timestamp": now_iso()}
             log_event("SUBMIT", {"signal": key, "symbol": sig["symbol"], "qty": qty, "order_ids": [t.order.orderId for t in trades], "account": paper_account, "sizing_equity_aud": equity})
             open_syms.add(sig["symbol"])
             risk_pct += CONFIG["risk_per_trade_pct"]
