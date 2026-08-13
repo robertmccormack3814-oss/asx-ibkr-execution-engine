@@ -1,0 +1,22 @@
+{
+  "source_scanner_url": "https://raw.githubusercontent.com/robertmccormack3814-oss/asx-opportunity-engine/main/data/scanner.json",
+  "paper_only": true,
+  "dry_run": true,
+  "kill_switch": false,
+  "risk_per_trade_pct": 0.5,
+  "max_total_open_risk_pct": 4.0,
+  "max_open_positions": 6,
+  "max_entry_drift_pct": 1.0,
+  "min_order_value_aud": 200,
+  "max_order_value_pct_of_equity": 30.0,
+  "currency": "AUD",
+  "exchange": "ASX",
+  "order_type": "LMT",
+  "time_in_force": "DAY",
+  "ibkr": {
+    "host": "127.0.0.1",
+    "port": 7497,
+    "client_id": 17,
+    "account": null
+  }
+}
