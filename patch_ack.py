@@ -116,7 +116,9 @@ if "def compute_performance_statistics(" not in text:
     text = text.replace(marker, helper, 1)
     changes.append("performance statistics helpers")
 
-if "compute_performance_statistics()" not in text:
+# Important: look specifically for the indented runtime call in main().
+# The old check matched the function definition itself and skipped this insertion.
+if "        compute_performance_statistics()\n" not in text:
     marker = '''        finalize_closed_trades(state, active)
 '''
     if marker not in text:
@@ -129,4 +131,4 @@ path.write_text(text, encoding="utf-8")
 if changes:
     print("engine.py patched successfully: " + ", ".join(changes))
 else:
-    print("engine.py already contains performance statistics")
+    print("engine.py already contains performance statistics and startup call")
