@@ -4,111 +4,21 @@ path = Path(__file__).with_name("engine.py")
 text = path.read_text(encoding="utf-8")
 changes = []
 
-# Ensure timezone/trading-day imports exist.
-if "from zoneinfo import ZoneInfo" not in text:
-    text = text.replace(
-        "from datetime import datetime, timezone",
-        "from datetime import datetime, timezone, timedelta\nfrom zoneinfo import ZoneInfo",
-        1,
-    )
-    changes.append("ASX timezone imports")
-
-# Add helper functions once.
-if "def signal_age_trading_days(" not in text:
-    marker = '''def signal_key(sig):
-    return f"{sig.get('symbol')}|{sig.get('signal_date')}|{sig.get('strategy')}|{sig.get('entry_price')}"
+# Add a cached external ASX price loader for paper testing only.
+if "def fetch_external_asx_prices(" not in text:
+    marker = '''def fetch_signals():
+    r = requests.get(CONFIG["source_scanner_url"], timeout=30)
+    r.raise_for_status()
+    return r.json()
 '''
-    helper = marker + '''\n\ndef signal_age_trading_days(sig):
-    """Weekday-based signal age in the ASX timezone.
-
-    v1 intentionally counts Monday-Friday only. ASX public-holiday awareness can
-    be added later if testing shows it matters for entry expiry.
-    """
-    raw = str(sig.get("signal_date") or "").strip()
-    if not raw:
-        return None
-    try:
-        signal_date = datetime.strptime(raw, "%Y-%m-%d").date()
-    except ValueError:
-        return None
-    today = datetime.now(ZoneInfo("Australia/Sydney")).date()
-    if signal_date > today:
-        return -1
-    return sum(
-        1
-        for i in range(1, (today - signal_date).days + 1)
-        if (signal_date + timedelta(days=i)).weekday() < 5
-    )
-'''
+    helper = marker + '''\n\n_EXTERNAL_PRICE_CACHE = None\n\ndef fetch_external_asx_prices():\n    global _EXTERNAL_PRICE_CACHE\n    if _EXTERNAL_PRICE_CACHE is not None:\n        return _EXTERNAL_PRICE_CACHE\n\n    cfg = CONFIG.get("external_price_feed", {})\n    if not cfg.get("enabled"):\n        return {}\n    if cfg.get("paper_only", True) and not CONFIG.get("paper_only"):\n        return {}\n\n    url = str(cfg.get("url") or "").strip()\n    if not url:\n        return {}\n\n    timeout = int(cfg.get("timeout_seconds", 30))\n    r = requests.get(url, timeout=timeout)\n    r.raise_for_status()\n    payload = r.json()\n    if isinstance(payload, str):\n        payload = json.loads(payload)\n    if not isinstance(payload, list):\n        raise RuntimeError("External ASX price feed returned unexpected payload")\n\n    prices = {}\n    for row in payload:\n        if not isinstance(row, dict):\n            continue\n        symbol = str(row.get("Code") or "").strip().upper()\n        try:\n            price = float(row.get("Price") or 0)\n        except (TypeError, ValueError):\n            price = 0.0\n        if symbol and price > 0 and math.isfinite(price):\n            prices[symbol] = {\n                "price": price,\n                "status": row.get("Status"),\n            }\n\n    _EXTERNAL_PRICE_CACHE = prices\n    return prices\n\ndef external_asx_price(symbol):\n    row = fetch_external_asx_prices().get(str(symbol).upper())\n    if not row:\n        return None, None\n    return float(row["price"]), row.get("status")\n'''
     if marker not in text:
-        raise SystemExit("signal_key patch target not found; refusing partial patch.")
+        raise SystemExit("fetch_signals patch target not found; refusing partial patch.")
     text = text.replace(marker, helper, 1)
-    changes.append("signal-age helper")
+    changes.append("external ASX price helper")
 
-# Insert stale check after existing working-order protection when present, or
-# immediately after signal key/state checks otherwise. Existing working orders
-# are deliberately protected first: this guard prevents NEW stale entries; it
-# does not cancel AVH/BVS or any other already-working bracket.
-if '"SKIP_STALE_SIGNAL"' not in text:
-    stale_block = '''            age_days = signal_age_trading_days(sig)
-            max_age = int(CONFIG.get("max_signal_age_trading_days", 2))
-            if age_days is None:
-                log_event("SKIP_STALE_SIGNAL", {
-                    "signal": key,
-                    "symbol": sig.get("symbol"),
-                    "reason": "missing or invalid signal_date",
-                })
-                continue
-            if age_days < 0:
-                log_event("SKIP_STALE_SIGNAL", {
-                    "signal": key,
-                    "symbol": sig.get("symbol"),
-                    "reason": "signal_date is in the future",
-                    "signal_age_trading_days": age_days,
-                })
-                continue
-            if age_days > max_age:
-                log_event("SKIP_STALE_SIGNAL", {
-                    "signal": key,
-                    "symbol": sig.get("symbol"),
-                    "reason": f"signal age {age_days} trading days exceeds limit {max_age}",
-                    "signal_age_trading_days": age_days,
-                    "max_signal_age_trading_days": max_age,
-                })
-                continue
-
-'''
-    # Local engine has duplicate-order guard from prior patch.
-    working_anchor = '''            if sig.get("symbol") in working_order_symbols:
-                log_event("SKIP_WORKING_ORDER", {
-                    "signal": key,
-                    "symbol": sig.get("symbol"),
-                    "reason": "working IBKR order already exists for symbol"
-                })
-                continue
-'''
-    if working_anchor in text:
-        text = text.replace(working_anchor, working_anchor + "\n" + stale_block, 1)
-    else:
-        state_anchor = '''            if key in state["seen_signals"] and state["seen_signals"][key].get("status") in {"SUBMITTED", "FILLED"}:
-                continue
-'''
-        if state_anchor not in text:
-            raise SystemExit("stale-signal insertion target not found; refusing partial patch.")
-        text = text.replace(state_anchor, state_anchor + "\n" + stale_block, 1)
-    changes.append("2-trading-day stale-signal guard")
-
-# Preserve the no-market-price safeguard from the previous patch.
+# Replace the strict no-market-price skip with IBKR-first, paper-only external fallback.
 old = '''            market_price = ticker.marketPrice()
-            price_source = "IBKR"
-            if not market_price or math.isnan(market_price):
-                market_price = float(sig["entry_price"])
-                price_source = "SIGNAL_FALLBACK"
-            ib.cancelMktData(contract)
-
-            ok, result = validate_signal(sig, market_price, equity, open_syms, risk_pct)
-'''
-new = '''            market_price = ticker.marketPrice()
             price_source = "IBKR"
             ib.cancelMktData(contract)
 
@@ -126,14 +36,49 @@ new = '''            market_price = ticker.marketPrice()
 
             ok, result = validate_signal(sig, market_price, equity, open_syms, risk_pct)
 '''
+new = '''            market_price = ticker.marketPrice()
+            price_source = "IBKR"
+            external_status = None
+            ib.cancelMktData(contract)
+
+            if not market_price or math.isnan(market_price) or market_price <= 0:
+                market_price, external_status = external_asx_price(sig.get("symbol"))
+                if market_price:
+                    price_source = "ASX_EXTERNAL_PAPER"
+
+            # Never fall back to the scanner's signal price. If neither IBKR
+            # nor the paper-only external feed has a usable current price,
+            # skip safely.
+            if not market_price or not math.isfinite(float(market_price)) or float(market_price) <= 0:
+                log_event("SKIP_NO_MARKET_PRICE", {
+                    "signal": key,
+                    "symbol": sig.get("symbol"),
+                    "reason": "no usable IBKR or external ASX market price",
+                })
+                continue
+
+            ok, result = validate_signal(sig, market_price, equity, open_syms, risk_pct)
+'''
 if old in text:
     text = text.replace(old, new, 1)
-    changes.append("no-market-price guard")
-elif '"SKIP_NO_MARKET_PRICE"' not in text:
-    raise SystemExit("Market-price safeguard patch target not found; refusing partial patch.")
+    changes.append("paper-only external price fallback")
+elif '"ASX_EXTERNAL_PAPER"' not in text:
+    raise SystemExit("External-price fallback target not found; refusing partial patch.")
+
+# Include external feed status in logs when present, without changing core validation.
+old_dry = '''                    "price_source": price_source,
+                    "entry": sig["entry_price"],
+'''
+new_dry = '''                    "price_source": price_source,
+                    "external_market_status": external_status,
+                    "entry": sig["entry_price"],
+'''
+if old_dry in text and '"external_market_status": external_status' not in text:
+    text = text.replace(old_dry, new_dry, 1)
+    changes.append("external price logging")
 
 path.write_text(text, encoding="utf-8")
 if changes:
     print("engine.py patched successfully: " + ", ".join(changes))
 else:
-    print("engine.py already contains stale-signal and no-market-price safeguards")
+    print("engine.py already contains paper-only external ASX price fallback")
