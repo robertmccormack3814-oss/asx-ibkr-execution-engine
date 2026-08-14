@@ -16,6 +16,12 @@
     "SQUEEZE_EXPANSION": 15,
     "TREND_BREAKOUT": 30
   },
+  "external_price_feed": {
+    "enabled": true,
+    "paper_only": true,
+    "url": "https://migizitech.wixsite.com/asxprices/_functions/getasxprices?apikey=free",
+    "timeout_seconds": 30
+  },
   "min_order_value_aud": 200,
   "max_order_value_pct_of_equity": 30.0,
   "currency": "AUD",
