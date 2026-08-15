@@ -1161,30 +1161,6 @@ def main():
                 })
                 continue
 
-            if sig["symbol"] in working_syms:
-                state["seen_signals"][key] = {
-                    "status": "WORKING_ORDER_EXISTS",
-                    "timestamp": now_iso(),
-                }
-                log_event("SKIP_WORKING_ORDER", {
-                    "signal": key,
-                    "symbol": sig["symbol"],
-                    "reason": "working IBKR order already exists for symbol",
-                })
-                continue
-
-            if sig["symbol"] in working_syms:
-                state["seen_signals"][key] = {
-                    "status": "WORKING_ORDER_EXISTS",
-                    "timestamp": now_iso(),
-                }
-                log_event("SKIP_WORKING_ORDER", {
-                    "signal": key,
-                    "symbol": sig["symbol"],
-                    "reason": "working IBKR order already exists for symbol",
-                })
-                continue
-
             contract = make_asx_contract(sig["symbol"])
             ib.qualifyContracts(contract)
             ticker = ib.reqMktData(contract, "", False, False)
