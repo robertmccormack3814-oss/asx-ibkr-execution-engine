@@ -8,11 +8,12 @@ from ib_insync import IB
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = json.loads((ROOT / "config.json").read_text())
+STATE_PATH = ROOT / "rsi_strategy_state.json"
 SYDNEY = ZoneInfo("Australia/Sydney")
 
 
 def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "asx-rsi-ibkr-dry-run/1.3"})
+    req = urllib.request.Request(url, headers={"User-Agent": "asx-rsi-ibkr-dry-run/1.4"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -23,6 +24,33 @@ def num(v):
         return x if math.isfinite(x) else None
     except Exception:
         return None
+
+
+def load_strategy_state():
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except Exception:
+            pass
+    start = float(CONFIG.get("strategy_starting_equity_aud", 5000))
+    return {
+        "starting_equity_aud": start,
+        "realized_pnl_aud": 0.0,
+        "commissions_aud": 0.0,
+        "current_strategy_equity_aud": start,
+        "managed_positions": {},
+        "completed_trades": [],
+    }
+
+
+def strategy_trade_value(state):
+    equity = num(state.get("current_strategy_equity_aud"))
+    if equity is None:
+        equity = float(CONFIG.get("strategy_starting_equity_aud", 5000))
+    pct = float(CONFIG.get("position_size_pct", 20.0))
+    max_pct = float(CONFIG.get("max_order_value_pct_of_equity", pct))
+    used_pct = min(pct, max_pct)
+    return equity, equity * used_pct / 100.0
 
 
 def enriched_signal(sig, stock=None, live=None):
@@ -43,12 +71,9 @@ def enriched_signal(sig, stock=None, live=None):
 
 
 def signal_freshness(sig):
-    """Only allow new signals generated today; never backfill historical active signals.
-    If an exact observed timestamp exists, also require it to be recent enough for entry."""
     today = datetime.now(SYDNEY).date().isoformat()
     if str(sig.get("entry_date", "")) != today:
         return False, "historical active signal — no backfill"
-
     observed = sig.get("entry_observed_at")
     if observed:
         try:
@@ -67,11 +92,9 @@ def signal_freshness(sig):
 def entry_eligibility(sig, market_on):
     if not market_on:
         return False, "ASX 200 below SMA200"
-
     fresh, reason = signal_freshness(sig)
     if not fresh:
         return False, reason
-
     price = num(sig.get("latest_price")) or num(sig.get("price"))
     rsi = num(sig.get("latest_rsi10"))
     if rsi is None:
@@ -79,7 +102,6 @@ def entry_eligibility(sig, market_on):
     sma = num(sig.get("sma200"))
     if sma is None:
         sma = num(sig.get("entry_sma200"))
-
     if price is None or price <= 0:
         return False, "no valid current price"
     if rsi is None:
@@ -90,20 +112,15 @@ def entry_eligibility(sig, market_on):
         return False, f"current RSI {rsi:.2f} is not below 30"
     if price <= sma:
         return False, f"current price is below SMA200 ({(price-sma)/sma*100:+.1f}%)"
-
     target = num(sig.get("rsi40_target_price"))
     move = num(sig.get("rsi40_move_pct"))
     if target is None or move is None:
         return False, "RSI40 target not ready"
     if target <= price or move <= 0:
         return False, "RSI40 target is not above current price"
-
-    # Avoid nonsensical paper orders in extremely low-priced names until we add
-    # a proper dollar-volume/spread filter from market data.
     min_price = float(CONFIG.get("min_entry_price_aud", 0.10))
     if price < min_price:
         return False, f"price below temporary liquidity floor A${min_price:.2f}"
-
     return True, "eligible"
 
 
@@ -120,12 +137,10 @@ def score_signal(sig):
     if sma is None:
         sma = num(sig.get("entry_sma200"))
     sma_buffer = ((price - sma) / sma * 100) if price and sma and sma > 0 else None
-
     move_component = max(0, min(move if move is not None else 0, 12)) / 12 * 55
     oversold = max(0, min((30 - rsi) if rsi is not None else 0, 12)) / 12 * 20
     support = max(0, min(sma_buffer if sma_buffer is not None else 0, 20)) / 20 * 25
-    score = move_component + oversold + support
-    return score, price, target, move, rsi, sma_buffer
+    return move_component + oversold + support, price, target, move, rsi, sma_buffer
 
 
 def main():
@@ -181,12 +196,12 @@ def main():
             if sym:
                 latest_completed[sym] = t
 
-        trade_value = float(CONFIG.get("trade_value_aud", 1000))
+        strategy_state = load_strategy_state()
+        strategy_equity, trade_value = strategy_trade_value(strategy_state)
         max_positions = int(CONFIG.get("max_open_positions", 5))
         free_slots = max(0, max_positions - len(positions) - len(open_symbols))
 
-        ranked = []
-        rejected = []
+        ranked, rejected = [], []
         for sym, sig in active_by_symbol.items():
             if sym in positions or sym in open_symbols:
                 continue
@@ -197,7 +212,7 @@ def main():
             score, price, target, move, rsi, sma_buffer = score_signal(sig)
             qty = max(0, int(trade_value // price)) if price else 0
             if qty < 1:
-                rejected.append((sym, "A$1,000 position cannot buy one share"))
+                rejected.append((sym, f"scaled position A${trade_value:.2f} cannot buy one share"))
                 continue
             value = qty * price
             ranked.append({"sym": sym, "sig": sig, "score": score, "price": price, "target": target, "move": move, "rsi": rsi, "sma_buffer": sma_buffer, "qty": qty, "value": value})
@@ -212,7 +227,8 @@ def main():
         print("OPEN ORDER SYMBOLS:", sorted(open_symbols))
         print("SCANNER ACTIVE SIGNALS:", len(active_by_symbol))
         print("ASX 200 ABOVE SMA200:", market_on)
-        print(f"A${trade_value:,.0f} PER TRADE | MAX POSITIONS {max_positions} | FREE SLOTS {free_slots}")
+        print(f"STRATEGY EQUITY: A${strategy_equity:,.2f}")
+        print(f"POSITION SIZE: {float(CONFIG.get('position_size_pct',20.0)):.1f}% = A${trade_value:,.2f} | MAX POSITIONS {max_positions} | FREE SLOTS {free_slots}")
         print(f"ENTRY-ELIGIBLE NOW: {len(ranked)} | REJECTED/STALE: {len(rejected)}")
         print("--- TOP ELIGIBLE CANDIDATES ---")
         if not ranked:
