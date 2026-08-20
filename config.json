@@ -1,29 +1,18 @@
 {
-  "source_scanner_url": "https://raw.githubusercontent.com/robertmccormack3814-oss/asx-opportunity-engine/main/data/scanner.json",
+  "source_scanner_url": "https://raw.githubusercontent.com/robertmccormack3814-oss/asx-rsi-scanner/main/data/scanner.json",
   "paper_only": true,
   "dry_run": true,
   "kill_switch": false,
-  "test_equity_override_aud": 10000,
+  "test_equity_override_aud": 5000,
   "risk_per_trade_pct": 0.5,
   "max_total_open_risk_pct": 4.0,
-  "max_open_positions": 6,
+  "max_open_positions": 5,
   "max_new_orders_per_run": 1,
   "max_entry_drift_pct": 1.0,
   "max_signal_age_trading_days": 2,
   "entry_expiry_trading_days": 2,
-  "max_holding_days_by_strategy": {
-    "MEAN_REVERSION": 10,
-    "SQUEEZE_EXPANSION": 15,
-    "TREND_BREAKOUT": 30
-  },
-  "external_price_feed": {
-    "enabled": true,
-    "paper_only": true,
-    "url": "https://migizitech.wixsite.com/asxprices/_functions/getasxprices?apikey=free",
-    "timeout_seconds": 30
-  },
   "min_order_value_aud": 200,
-  "max_order_value_pct_of_equity": 30.0,
+  "max_order_value_pct_of_equity": 20.0,
   "currency": "AUD",
   "exchange": "ASX",
   "order_type": "LMT",
@@ -32,6 +21,6 @@
     "host": "127.0.0.1",
     "port": 7497,
     "client_id": 17,
-    "account": "DUR858795"
+    "account": "DUR896854"
   }
 }
