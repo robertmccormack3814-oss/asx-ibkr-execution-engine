@@ -1,15 +1,18 @@
 import json
 import math
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from ib_insync import IB
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = json.loads((ROOT / "config.json").read_text())
+SYDNEY = ZoneInfo("Australia/Sydney")
 
 
 def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "asx-rsi-ibkr-dry-run/1.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": "asx-rsi-ibkr-dry-run/1.3"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -23,12 +26,9 @@ def num(v):
 
 
 def enriched_signal(sig, stock=None, live=None):
-    """Merge scanner signal + stock snapshot + latest intraday monitor values.
-    Later sources win only for live fields; original entry fields are preserved."""
     out = dict(stock or {})
     out.update(sig or {})
     live = live or {}
-    # Map intraday monitor field names onto the fields used by the ranker.
     if live.get("price") is not None:
         out["price"] = live["price"]
         out["latest_price"] = live["price"]
@@ -42,9 +42,72 @@ def enriched_signal(sig, stock=None, live=None):
     return out
 
 
+def signal_freshness(sig):
+    """Only allow new signals generated today; never backfill historical active signals.
+    If an exact observed timestamp exists, also require it to be recent enough for entry."""
+    today = datetime.now(SYDNEY).date().isoformat()
+    if str(sig.get("entry_date", "")) != today:
+        return False, "historical active signal — no backfill"
+
+    observed = sig.get("entry_observed_at")
+    if observed:
+        try:
+            dt = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_minutes = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 60
+            max_age = float(CONFIG.get("max_entry_signal_age_minutes", 20))
+            if age_minutes > max_age:
+                return False, f"entry signal {age_minutes:.0f} min old"
+        except Exception:
+            return False, "invalid entry timestamp"
+    return True, "fresh"
+
+
+def entry_eligibility(sig, market_on):
+    if not market_on:
+        return False, "ASX 200 below SMA200"
+
+    fresh, reason = signal_freshness(sig)
+    if not fresh:
+        return False, reason
+
+    price = num(sig.get("latest_price")) or num(sig.get("price"))
+    rsi = num(sig.get("latest_rsi10"))
+    if rsi is None:
+        rsi = num(sig.get("rsi10"))
+    sma = num(sig.get("sma200"))
+    if sma is None:
+        sma = num(sig.get("entry_sma200"))
+
+    if price is None or price <= 0:
+        return False, "no valid current price"
+    if rsi is None:
+        return False, "no current RSI"
+    if sma is None or sma <= 0:
+        return False, "no SMA200 data"
+    if rsi >= 30:
+        return False, f"current RSI {rsi:.2f} is not below 30"
+    if price <= sma:
+        return False, f"current price is below SMA200 ({(price-sma)/sma*100:+.1f}%)"
+
+    target = num(sig.get("rsi40_target_price"))
+    move = num(sig.get("rsi40_move_pct"))
+    if target is None or move is None:
+        return False, "RSI40 target not ready"
+    if target <= price or move <= 0:
+        return False, "RSI40 target is not above current price"
+
+    # Avoid nonsensical paper orders in extremely low-priced names until we add
+    # a proper dollar-volume/spread filter from market data.
+    min_price = float(CONFIG.get("min_entry_price_aud", 0.10))
+    if price < min_price:
+        return False, f"price below temporary liquidity floor A${min_price:.2f}"
+
+    return True, "eligible"
+
+
 def score_signal(sig):
-    """Rank only when the live RSI40 target is available.
-    This is a candidate-ranking heuristic, not a return forecast."""
     price = num(sig.get("latest_price")) or num(sig.get("price")) or num(sig.get("entry_price"))
     target = num(sig.get("rsi40_target_price"))
     move = num(sig.get("rsi40_move_pct"))
@@ -53,19 +116,12 @@ def score_signal(sig):
     rsi = num(sig.get("latest_rsi10"))
     if rsi is None:
         rsi = num(sig.get("rsi10"))
-    if rsi is None:
-        rsi = num(sig.get("entry_rsi10"))
-    sma = num(sig.get("sma200")) or num(sig.get("entry_sma200"))
+    sma = num(sig.get("sma200"))
+    if sma is None:
+        sma = num(sig.get("entry_sma200"))
     sma_buffer = ((price - sma) / sma * 100) if price and sma and sma > 0 else None
 
-    # We do NOT select a candidate for the "bigger move" portfolio until the
-    # same intraday system that manages exits has produced an RSI40 target.
-    if target is None or move is None:
-        return None, price, target, move, rsi, sma_buffer
-
-    # Reward meaningful upside, but cap it so a collapsing stock cannot win
-    # merely because its theoretical recovery distance is enormous.
-    move_component = max(0, min(move, 12)) / 12 * 55
+    move_component = max(0, min(move if move is not None else 0, 12)) / 12 * 55
     oversold = max(0, min((30 - rsi) if rsi is not None else 0, 12)) / 12 * 20
     support = max(0, min(sma_buffer if sma_buffer is not None else 0, 20)) / 20 * 25
     score = move_component + oversold + support
@@ -100,6 +156,7 @@ def main():
         completed = scanner.get("completed_trades", [])
         stock_map = {str(x.get("symbol", "")).upper(): x for x in scanner.get("stocks", []) if x.get("symbol")}
         live_map = intraday.get("latest", {}) or {}
+        market_on = bool((scanner.get("market") or {}).get("above_sma200", False))
 
         positions = {p.contract.symbol.upper(): p for p in ib.positions() if p.position != 0}
         open_symbols = set()
@@ -129,45 +186,45 @@ def main():
         free_slots = max(0, max_positions - len(positions) - len(open_symbols))
 
         ranked = []
-        waiting_for_target = []
+        rejected = []
         for sym, sig in active_by_symbol.items():
             if sym in positions or sym in open_symbols:
                 continue
+            eligible, reason = entry_eligibility(sig, market_on)
+            if not eligible:
+                rejected.append((sym, reason))
+                continue
             score, price, target, move, rsi, sma_buffer = score_signal(sig)
-            if not price or price <= 0:
-                continue
-            qty = max(0, int(trade_value // price))
-            value = qty * price
+            qty = max(0, int(trade_value // price)) if price else 0
             if qty < 1:
+                rejected.append((sym, "A$1,000 position cannot buy one share"))
                 continue
-            row = {"sym": sym, "sig": sig, "score": score, "price": price, "target": target, "move": move, "rsi": rsi, "sma_buffer": sma_buffer, "qty": qty, "value": value}
-            if score is None:
-                waiting_for_target.append(row)
-            else:
-                ranked.append(row)
+            value = qty * price
+            ranked.append({"sym": sym, "sig": sig, "score": score, "price": price, "target": target, "move": move, "rsi": rsi, "sma_buffer": sma_buffer, "qty": qty, "value": value})
 
         ranked.sort(key=lambda x: (x["score"], x["move"]), reverse=True)
         selected = ranked[:free_slots]
 
-        print("RSI -> IBKR DRY RUN — TARGET-MOVE SELECTOR")
+        print("RSI -> IBKR DRY RUN — FRESH-SIGNAL SELECTOR")
         print("CONNECTED:", ib.isConnected())
         print("ACCOUNT:", expected or accounts)
         print("POSITIONS:", sorted(positions))
         print("OPEN ORDER SYMBOLS:", sorted(open_symbols))
         print("SCANNER ACTIVE SIGNALS:", len(active_by_symbol))
+        print("ASX 200 ABOVE SMA200:", market_on)
         print(f"A${trade_value:,.0f} PER TRADE | MAX POSITIONS {max_positions} | FREE SLOTS {free_slots}")
-        print(f"TARGET DATA READY: {len(ranked)} | WAITING FOR RSI40 TARGET: {len(waiting_for_target)}")
-        print("--- TOP RANKED CANDIDATES ---")
+        print(f"ENTRY-ELIGIBLE NOW: {len(ranked)} | REJECTED/STALE: {len(rejected)}")
+        print("--- TOP ELIGIBLE CANDIDATES ---")
+        if not ranked:
+            print("No fresh signals currently satisfy every entry rule. Historical active signals are intentionally not backfilled.")
         for i, x in enumerate(ranked[:15], 1):
             chosen = "SELECT" if x in selected else "RESERVE"
-            mv = f"{x['move']:+.2f}%"
-            tgt = f"A${x['target']:.3f}"
-            rv = f"{x['rsi']:.2f}" if x["rsi"] is not None else "—"
             sb = f"{x['sma_buffer']:+.1f}%" if x["sma_buffer"] is not None else "—"
-            print(f"#{i:02d} {chosen:7} {x['sym']:6} score {x['score']:5.1f} | RSI {rv} | est move->40 {mv} | target {tgt} | SMA200 buffer {sb} | {x['qty']} shares ~A${x['value']:.2f}")
+            print(f"#{i:02d} {chosen:7} {x['sym']:6} score {x['score']:5.1f} | RSI {x['rsi']:.2f} | est move->40 {x['move']:+.2f}% | target A${x['target']:.3f} | SMA200 buffer {sb} | {x['qty']} shares ~A${x['value']:.2f}")
 
-        if not ranked:
-            print("No candidates selected yet because live RSI40 target data is not available. This is intentional.")
+        print("--- REJECTION SUMMARY (first 15) ---")
+        for sym, reason in rejected[:15]:
+            print(f"SKIP {sym}: {reason}")
 
         print("--- PROPOSED PAPER PORTFOLIO ---")
         if not selected:
@@ -186,7 +243,7 @@ def main():
                 print(f"UNMANAGED POSITION {sym}: no active RSI signal; NO ACTION")
 
         print("---")
-        print(f"Eligible with target data: {len(ranked)} | Selected now: {len(selected)} | Waiting for target data: {len(waiting_for_target)}")
+        print(f"Eligible now: {len(ranked)} | Selected now: {len(selected)} | Rejected/stale: {len(rejected)}")
         print("NO ORDERS SUBMITTED. TWS/API remains read-only.")
     finally:
         ib.disconnect()
