@@ -1,0 +1,8 @@
+{
+  "starting_equity_aud": 5000.0,
+  "realized_pnl_aud": 0.0,
+  "commissions_aud": 0.0,
+  "current_strategy_equity_aud": 5000.0,
+  "managed_positions": {},
+  "completed_trades": []
+}
